@@ -30,6 +30,7 @@ func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 type WorkerInfo struct {
 	id_ int
+	task_type_ TaskType
 }
 
 func kva_to_str(kva *[]KeyValue) (buf string) {
@@ -177,26 +178,26 @@ func RequestForWork(mapf func(string, string) []KeyValue, reducef func(string, [
 	}
 
 	// handle work
-	GetWorkerInfo().id_ = rep.Task_id_
-	var done bool
-	if rep.Task_type_ == MapTask {
+	if rep.Task_type_ == MapTask { // do Map task
 		ofile_name_list := make([]string, rep.NReduce_)
 		for i, _ := range ofile_name_list {
 			ofile_name_list[i] = fmt.Sprintf("src/main/mr-tmp/mr-%d-%d.txt", rep.Task_id_, i)
 		}
-		done = DoMap(mapf, rep.Ifile_name_, ofile_name_list, rep.NReduce_)
-	} else if rep.Task_type_ == ReduceTask {
+		DoMap(mapf, rep.Ifile_name_, ofile_name_list, rep.NReduce_)
+
+		task_done_req := MapWorkDoneReq{Task_id_: rep.Task_id_, Intermediate_files_: ofile_name_list}
+		task_done_rep := WorkDoneRep{}
+		ok = call("Coordinator.MapWorkDone", &task_done_req, &task_done_rep)
+
+	} else if rep.Task_type_ == ReduceTask { // do reduce task
 		ofile_name_list := fmt.Sprintf("src/main/mr-tmp/mr-out-%d", rep.Task_id_)
 		DoReduce(reducef, rep.Ifile_name_list_, ofile_name_list, rep.Task_id_)
+
+		task_done_req := ReduceWorkDoneReq{Task_id_: rep.Task_id_}
+		task_done_rep := WorkDoneRep{}
+		ok = call("Coordinator.ReduceWorkDone", &task_done_req, &task_done_rep)
 	}
 
-	// reply of task
-	task_done_req := WorkDoneReq{Task_id_: GetWorkerInfo().id_, Done_: true}
-	if !done {
-		task_done_req.Done_ = false
-	}
-	task_done_rep := WorkDoneRep{}
-	ok = call("Coordinator.WorkDone", &task_done_req, &task_done_rep)
 	if !ok {
 		log.Fatalf("[Worker] Reply of task failed!\n")
 	}
@@ -205,7 +206,9 @@ func RequestForWork(mapf func(string, string) []KeyValue, reducef func(string, [
 }
 
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
-
+	for {
+		RequestForWork(mapf, reducef)
+	}
 }
 
 

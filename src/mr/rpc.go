@@ -38,9 +38,13 @@ type TaskRep struct {
 	Ifile_name_list_ []string
 }
 
-type WorkDoneReq struct {
+type MapWorkDoneReq struct {
 	Task_id_ int
-	Done_ bool
+	Intermediate_files_ []string
+}
+
+type ReduceWorkDoneReq struct {
+	Task_id_ int
 }
 
 type WorkDoneRep struct {}
