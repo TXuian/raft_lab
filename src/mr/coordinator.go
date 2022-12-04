@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"reflect"
 )
 
 type TaskStatus int
@@ -27,10 +28,11 @@ type TaskHandle struct {
 	input_file_ string
 	status_ TaskStatus
 	output_file_ []string
+	count_down_ int
 }
 
 // TaskTable --> <filename, taskinfo>
-type TaskTable map[int]TaskHandle
+type TaskTable map[int]*TaskHandle
 
 type Coordinator struct {
 	// Your definitions here.
@@ -44,6 +46,28 @@ type Coordinator struct {
 	all_done_ bool
 }
 
+func (lh *Coordinator) Equal(rh *Coordinator) bool {
+	for i, lh_map_handle := range lh.map_task_table_ {
+		if !reflect.DeepEqual(lh_map_handle, rh.map_task_table_[i]) {
+			return false
+		}
+	}
+
+	for i, lh_reduce_handle := range lh.reduce_task_table_ {
+		if !reflect.DeepEqual(lh_reduce_handle, rh.reduce_task_table_[i]) {
+			return false
+		}
+	}
+
+	return (
+		lh.nMap_ == rh.nMap_ &&
+		lh.nReduce_ == rh.nReduce_ &&
+		lh.map_done_ == rh.map_done_ &&
+		lh.map_done_cnt_ == rh.map_done_cnt_ &&
+		lh.reduce_done_cnt_ == rh.reduce_done_cnt_ &&
+		lh.all_done_ == rh.all_done_)
+}
+
 type CoorErr string
 
 func (ce CoorErr) Error() string {
@@ -55,7 +79,7 @@ const (
 )
 
 // Your code here -- RPC handlers for the worker to call.
-func GatherReduceFiles(file_list *[]string, map_table map[int]TaskHandle, reduce_idx int) {
+func GatherReduceFiles(file_list *[]string, map_table TaskTable, reduce_idx int) {
 	var map_idx int
 	var cur_idx int
 	for _, map_task := range map_table {
@@ -77,6 +101,9 @@ func (c *Coordinator) HandleWorker(request *TaskReq, reply *TaskRep) error {
 			reply.Task_type_ = MapTask 
 			reply.Ifile_name_ = map_task.input_file_
 			reply.NReduce_ = c.nReduce_
+			// handle task info
+			map_task.status_ = Task_InProcess
+			map_task.count_down_ = 10
 			return nil
 		}
 	}
@@ -90,6 +117,9 @@ func (c *Coordinator) HandleWorker(request *TaskReq, reply *TaskRep) error {
 			reply.Task_id_ = i
 			reply.Task_type_ = ReduceTask
 			GatherReduceFiles(&(reply.Ifile_name_list_), c.map_task_table_, i)
+			reduce_task.status_ = Task_InProcess
+			reduce_task.count_down_ = 10
+			return nil
 		}
 	}
 	if !c.all_done_ {
@@ -98,11 +128,22 @@ func (c *Coordinator) HandleWorker(request *TaskReq, reply *TaskRep) error {
 	return nil
 }
 
-func (c *Coordinator) MapWorkDone(reuqest *MapWorkDoneReq, reply *WorkDoneRep) error {
+func (c *Coordinator) MapWorkDone(request *MapWorkDoneReq, reply *WorkDoneRep) error {
+	c.map_task_table_[request.Task_id_].status_ = Task_Completed
+	c.map_task_table_[request.Task_id_].output_file_ = request.Intermediate_files_
+	c.map_done_cnt_++
+	if c.map_done_cnt_ == c.nMap_ {
+		c.map_done_ = true
+	}
 	return nil
 }
 
 func (c *Coordinator) ReduceWorkDone(request *ReduceWorkDoneReq, reply *WorkDoneRep) error {
+	c.reduce_task_table_[request.Task_id_].status_ = Task_Completed
+	c.reduce_done_cnt_++
+	if c.reduce_done_cnt_ == c.nReduce_ {
+		c.all_done_ = true
+	}
 	return nil
 }
 
@@ -151,26 +192,34 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 // files: input file that should deliver to map workers
 // nReduce
-func MakeCoordinator(files []string, nReduce int) *Coordinator {
+func InitCoordinator(files *[]string, nReduce int) *Coordinator {
 	c := Coordinator{
 		map_done_cnt_: 0, 
 		reduce_done_cnt_: 0, 
-		nMap_: len(files), 
+		nMap_: len(*files), 
 		nReduce_: nReduce,
 		map_done_: false,
 		all_done_: false,
 	}
 
 	// Your code here.
+	c.map_task_table_ = make(TaskTable, 0)
+	c.reduce_task_table_ = make(TaskTable, 0)
 	// build map tasks
-	for i, file_name := range files {
-		c.map_task_table_[i] = TaskHandle{input_file_: file_name, status_: Task_Idle, output_file_: make([]string, 0)}
+	for i, file_name := range *files {
+		c.map_task_table_[i] = &TaskHandle{input_file_: file_name, status_: Task_Idle, output_file_: make([]string, 0)}
 	}
 	// build reduce tasks
 	for i := 0; i < nReduce; i++ {
-		c.reduce_task_table_[i] = TaskHandle{status_: Task_Idle}
+		c.reduce_task_table_[i] = &TaskHandle{status_: Task_Idle}
 	}
 
-	c.server()
 	return &c
+}
+
+func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	c := InitCoordinator(&files, nReduce)
+
+	c.server()
+	return c
 }
