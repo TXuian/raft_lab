@@ -168,33 +168,33 @@ func GetWorkerInfo() *WorkerInfo {
     return instance
 }
 
-func RequestForWork(mapf func(string, string) []KeyValue, reducef func(string, []string) string) error {
+func RequestForWork(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 	// do remote call
 	req := TaskReq{}
 	rep := TaskRep{}
 	ok := call("Coordinator.HandleWorker", req, &rep)
 	if !ok {
-		log.Fatalf("[Worker] Request for task failed!\n")
+		return
 	}
 
 	// handle work
+	task_done_rep := WorkDoneRep{}
+
 	if rep.Task_type_ == MapTask { // do Map task
 		ofile_name_list := make([]string, rep.NReduce_)
 		for i, _ := range ofile_name_list {
 			ofile_name_list[i] = fmt.Sprintf("src/main/mr-tmp/mr-%d-%d.txt", rep.Task_id_, i)
 		}
 		DoMap(mapf, rep.Ifile_name_, ofile_name_list, rep.NReduce_)
-
+		// report
 		task_done_req := MapWorkDoneReq{Task_id_: rep.Task_id_, Intermediate_files_: ofile_name_list}
-		task_done_rep := WorkDoneRep{}
 		ok = call("Coordinator.MapWorkDone", &task_done_req, &task_done_rep)
 
 	} else if rep.Task_type_ == ReduceTask { // do reduce task
 		ofile_name_list := fmt.Sprintf("src/main/mr-tmp/mr-out-%d", rep.Task_id_)
 		DoReduce(reducef, rep.Ifile_name_list_, ofile_name_list, rep.Task_id_)
-
+		// report
 		task_done_req := ReduceWorkDoneReq{Task_id_: rep.Task_id_}
-		task_done_rep := WorkDoneRep{}
 		ok = call("Coordinator.ReduceWorkDone", &task_done_req, &task_done_rep)
 	}
 
@@ -202,7 +202,7 @@ func RequestForWork(mapf func(string, string) []KeyValue, reducef func(string, [
 		log.Fatalf("[Worker] Reply of task failed!\n")
 	}
 	
-	return nil
+	return 
 }
 
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
@@ -231,7 +231,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	if err == nil {
 		return true
 	}
-
-	fmt.Println(err)
+	log.Fatalf("[Worker] Call error: %s\n", err.Error())
 	return false
 }

@@ -6,7 +6,7 @@ import (
 
 func TestCoordinator(t *testing.T) {
 
-	t.Run("test ", func(t *testing.T){
+	t.Run("test HandleWorker", func(t *testing.T){
 		t.Helper()
 
 		// files := []string {"A", "B", "C", "D"}

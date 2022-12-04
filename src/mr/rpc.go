@@ -47,7 +47,8 @@ type ReduceWorkDoneReq struct {
 	Task_id_ int
 }
 
-type WorkDoneRep struct {}
+type WorkDoneRep struct {
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
