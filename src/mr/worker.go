@@ -231,6 +231,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	if err == nil {
 		return true
 	}
-	log.Fatalf("[Worker] Call error: %s\n", err.Error())
+	// fmt.Printf("[Worker] Call error: %s\n", err.Error())
 	return false
 }

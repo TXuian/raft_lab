@@ -16,8 +16,8 @@ type TaskStatus int
 type TaskType int
 
 const (
-	tmp_file_pattern = "./mr-tmp/mr-%d-%d"
-	output_file_pattern = "./mr-tmp/mr-out-%d"
+	tmp_file_pattern = "mr-%d-%d"
+	output_file_pattern = "mr-out-%d"
 )
 
 
@@ -86,6 +86,7 @@ func (ce CoorErr) Error() string {
 
 const (
 	err_no_task = CoorErr("[Coordinator] No task to dispatch")
+	err_finished = CoorErr("[Coordinator] Task Finished")
 )
 
 // Your code here -- RPC handlers for the worker to call.
@@ -107,39 +108,49 @@ func (c *Coordinator) HandleWorker(request *TaskReq, reply *TaskRep) error {
 	// find a map task to dispatch
 	for i, map_task := range c.map_task_table_ {
 		map_task.mu.Lock()
-		defer map_task.mu.Unlock()
+		// defer map_task.mu.Unlock()
 		if map_task.status_ == Task_Idle {
+			map_task.status_ = Task_InProcess
+			map_task.mu.Unlock()
 			reply.Task_id_ = i
 			reply.Task_type_ = MapTask 
 			reply.Ifile_name_ = map_task.input_file_
 			reply.NReduce_ = c.nReduce_
 			// handle task info
-			c.map_task_table_[i].status_ = Task_InProcess
-			go c.CheckTime(c.map_task_table_[i])
+			go CheckTime(c.map_task_table_[i])
 			return nil
 		}
+		map_task.mu.Unlock()
 	}
 	// no map to dispatch
+	c.mu.Lock()
 	if !c.map_done_ {
+		c.mu.Unlock()
 		return err_no_task
 	}
+	c.mu.Unlock()
 	// dispatch reduce task
 	for i, reduce_task := range c.reduce_task_table_ {
 		reduce_task.mu.Lock()
-		defer reduce_task.mu.Unlock()
+		// defer reduce_task.mu.Unlock()
 		if reduce_task.status_ == Task_Idle {
+			reduce_task.status_ = Task_InProcess
+			reduce_task.mu.Unlock()
 			reply.Task_id_ = i
 			reply.Task_type_ = ReduceTask
 			GatherReduceFiles(&(reply.Ifile_name_list_), c.map_task_table_, i)
-			c.reduce_task_table_[i].status_ = Task_InProcess
-			go c.CheckTime(c.reduce_task_table_[i])
+			go CheckTime(c.reduce_task_table_[i])
 			return nil
 		}
+		reduce_task.mu.Unlock()
 	}
+	c.mu.Lock()
 	if !c.all_done_ {
+		c.mu.Unlock()
 		return err_no_task
 	}
-	return nil
+	c.mu.Unlock()
+	return err_finished
 }
 
 func (c *Coordinator) MapWorkDone(request *MapWorkDoneReq, reply *WorkDoneRep) error {
@@ -166,20 +177,22 @@ func (c *Coordinator) ReduceWorkDone(request *ReduceWorkDoneReq, reply *WorkDone
 	c.reduce_task_table_[request.Task_id_].mu.Unlock()
 
 	// update coordinator info	
-	c.reduce_done_cnt_++
 	c.mu.Lock()
+	c.reduce_done_cnt_++
 	defer c.mu.Unlock()
 	if c.reduce_done_cnt_ == c.nReduce_ {
 		c.all_done_ = true
 	}
-	return nil
+	return nil 
 }
 
-func (c *Coordinator) CheckTime(task_handle *TaskHandle) {
+func CheckTime(task_handle *TaskHandle) {
 	time.Sleep(10 * time.Second)
+	// fmt.Printf("Task %d time exceeded\n")
 	task_handle.mu.Lock()
 	defer task_handle.mu.Unlock()
 	if task_handle.status_ != Task_Completed {
+		fmt.Println("Recover Task: %s", task_handle.input_file_)
 		task_handle.status_ = Task_Idle
 	}
 }
