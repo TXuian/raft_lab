@@ -8,10 +8,18 @@ import (
 	"net/rpc"
 	"os"
 	"reflect"
+	"sync"
+	"time"
 )
 
 type TaskStatus int
 type TaskType int
+
+const (
+	tmp_file_pattern = "./mr-tmp/mr-%d-%d"
+	output_file_pattern = "./mr-tmp/mr-out-%d"
+)
+
 
 const (
 	Task_Idle = TaskStatus(0)
@@ -29,6 +37,7 @@ type TaskHandle struct {
 	status_ TaskStatus
 	output_file_ []string
 	count_down_ int
+	mu sync.Mutex
 }
 
 // TaskTable --> <filename, taskinfo>
@@ -44,6 +53,7 @@ type Coordinator struct {
 	map_done_ bool
 	reduce_done_cnt_ int
 	all_done_ bool
+	mu sync.Mutex
 }
 
 func (lh *Coordinator) Equal(rh *Coordinator) bool {
@@ -84,7 +94,7 @@ func GatherReduceFiles(file_list *[]string, map_table TaskTable, reduce_idx int)
 	var cur_idx int
 	for _, map_task := range map_table {
 		for _, file_name := range map_task.output_file_ {
-			fmt.Sscanf(file_name, "*/mr-%d-%d.txt", &map_idx, &cur_idx)
+			fmt.Sscanf(file_name, tmp_file_pattern, &map_idx, &cur_idx)
 			if cur_idx == reduce_idx {
 				*file_list = append(*file_list, file_name)
 				break
@@ -96,14 +106,16 @@ func GatherReduceFiles(file_list *[]string, map_table TaskTable, reduce_idx int)
 func (c *Coordinator) HandleWorker(request *TaskReq, reply *TaskRep) error {
 	// find a map task to dispatch
 	for i, map_task := range c.map_task_table_ {
+		map_task.mu.Lock()
+		defer map_task.mu.Unlock()
 		if map_task.status_ == Task_Idle {
 			reply.Task_id_ = i
 			reply.Task_type_ = MapTask 
 			reply.Ifile_name_ = map_task.input_file_
 			reply.NReduce_ = c.nReduce_
 			// handle task info
-			map_task.status_ = Task_InProcess
-			map_task.count_down_ = 10
+			c.map_task_table_[i].status_ = Task_InProcess
+			go c.CheckTime(c.map_task_table_[i])
 			return nil
 		}
 	}
@@ -113,12 +125,14 @@ func (c *Coordinator) HandleWorker(request *TaskReq, reply *TaskRep) error {
 	}
 	// dispatch reduce task
 	for i, reduce_task := range c.reduce_task_table_ {
+		reduce_task.mu.Lock()
+		defer reduce_task.mu.Unlock()
 		if reduce_task.status_ == Task_Idle {
 			reply.Task_id_ = i
 			reply.Task_type_ = ReduceTask
 			GatherReduceFiles(&(reply.Ifile_name_list_), c.map_task_table_, i)
-			reduce_task.status_ = Task_InProcess
-			reduce_task.count_down_ = 10
+			c.reduce_task_table_[i].status_ = Task_InProcess
+			go c.CheckTime(c.reduce_task_table_[i])
 			return nil
 		}
 	}
@@ -129,8 +143,15 @@ func (c *Coordinator) HandleWorker(request *TaskReq, reply *TaskRep) error {
 }
 
 func (c *Coordinator) MapWorkDone(request *MapWorkDoneReq, reply *WorkDoneRep) error {
+	// update task info
+	c.map_task_table_[request.Task_id_].mu.Lock()
 	c.map_task_table_[request.Task_id_].status_ = Task_Completed
 	c.map_task_table_[request.Task_id_].output_file_ = request.Intermediate_files_
+	c.map_task_table_[request.Task_id_].mu.Unlock()
+	
+	// update coordainator info
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.map_done_cnt_++
 	if c.map_done_cnt_ == c.nMap_ {
 		c.map_done_ = true
@@ -139,12 +160,28 @@ func (c *Coordinator) MapWorkDone(request *MapWorkDoneReq, reply *WorkDoneRep) e
 }
 
 func (c *Coordinator) ReduceWorkDone(request *ReduceWorkDoneReq, reply *WorkDoneRep) error {
+	// update task info
+	c.reduce_task_table_[request.Task_id_].mu.Lock()
 	c.reduce_task_table_[request.Task_id_].status_ = Task_Completed
+	c.reduce_task_table_[request.Task_id_].mu.Unlock()
+
+	// update coordinator info	
 	c.reduce_done_cnt_++
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.reduce_done_cnt_ == c.nReduce_ {
 		c.all_done_ = true
 	}
 	return nil
+}
+
+func (c *Coordinator) CheckTime(task_handle *TaskHandle) {
+	time.Sleep(10 * time.Second)
+	task_handle.mu.Lock()
+	defer task_handle.mu.Unlock()
+	if task_handle.status_ != Task_Completed {
+		task_handle.status_ = Task_Idle
+	}
 }
 
 //

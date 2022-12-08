@@ -148,7 +148,7 @@ func DoReduce(reducef func(string, []string) string, ifile_name_list []string, o
 	}
 	sort.Sort(ByKey(intermediate_kva))
 	
-	ofile_tmp_name := fmt.Sprintf("src/main/mr-tmp/mr-r%d.txt", id)
+	ofile_tmp_name := fmt.Sprintf(output_file_pattern, id)
 	ofile_tmp, err := os.OpenFile(ofile_tmp_name, os.O_CREATE | os.O_APPEND | os.O_RDWR, 0744)
 	log_error(err, "[REDUCE] Failed to create tmp file")
 	ok := ReduceOutput(reducef, ofile_tmp, &intermediate_kva)
@@ -183,7 +183,7 @@ func RequestForWork(mapf func(string, string) []KeyValue, reducef func(string, [
 	if rep.Task_type_ == MapTask { // do Map task
 		ofile_name_list := make([]string, rep.NReduce_)
 		for i, _ := range ofile_name_list {
-			ofile_name_list[i] = fmt.Sprintf("src/main/mr-tmp/mr-%d-%d.txt", rep.Task_id_, i)
+			ofile_name_list[i] = fmt.Sprintf(tmp_file_pattern, rep.Task_id_, i)
 		}
 		DoMap(mapf, rep.Ifile_name_, ofile_name_list, rep.NReduce_)
 		// report
@@ -191,7 +191,7 @@ func RequestForWork(mapf func(string, string) []KeyValue, reducef func(string, [
 		ok = call("Coordinator.MapWorkDone", &task_done_req, &task_done_rep)
 
 	} else if rep.Task_type_ == ReduceTask { // do reduce task
-		ofile_name_list := fmt.Sprintf("src/main/mr-tmp/mr-out-%d", rep.Task_id_)
+		ofile_name_list := fmt.Sprintf(output_file_pattern, rep.Task_id_)
 		DoReduce(reducef, rep.Ifile_name_list_, ofile_name_list, rep.Task_id_)
 		// report
 		task_done_req := ReduceWorkDoneReq{Task_id_: rep.Task_id_}
