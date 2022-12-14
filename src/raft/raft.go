@@ -19,13 +19,14 @@ package raft
 
 import (
 	//	"bytes"
+	"math/rand"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -53,6 +54,14 @@ type ApplyMsg struct {
 //
 // A Go object implementing a single Raft peer.
 //
+type RaftStatus int32
+
+const (
+	FOLLOWER = RaftStatus(0)
+	CANDIDATE = RaftStatus(1)
+	LEADER = RaftStatus(2)
+)
+
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -61,6 +70,12 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
+	current_term_ int32
+	term_mu_ sync.Mutex
+	voted_for_ int32
+	status_ RaftStatus
+	status_mu sync.Mutex
+	heartbeat_ bool
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -69,11 +84,8 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	return int(rf.current_term_), rf.status_ == LEADER 
 }
 
 //
@@ -136,28 +148,60 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
+// rpc structs
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	CandidateId_ int32
+	Term_ int32
 }
 
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
 type RequestVoteReply struct {
 	// Your data here (2A).
+	VoteGranted_ bool
+	Term_ int32
 }
 
-//
-// example RequestVote RPC handler.
-//
+type RequestAppendEntry struct {
+	Term_ int32
+	LeaderId_ int32
+}
+
+type ReplyAppendEntry struct {
+	Term_ int32
+	Success_ bool
+}
+
+// rpc receiver
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.term_mu_.Lock()
+	defer rf.term_mu_.Unlock()
+	// A: vote for not
+	if args.Term_ < rf.current_term_ {
+		reply.Term_ = rf.current_term_
+		reply.VoteGranted_ = false
+		return
+	} 
+
+	// B: vote for yes
+	// update server info
+	if args.Term_ > rf.current_term_ {
+		rf.current_term_ = args.Term_
+		rf.voted_for_ = -1 
+	}
+
+	// do the vote
+	reply.Term_ = rf.current_term_
+	if rf.voted_for_ == args.CandidateId_ || rf.voted_for_ == -1 {
+		rf.voted_for_ = args.CandidateId_
+		reply.VoteGranted_ = true
+	} else {
+		reply.VoteGranted_ = false
+	}
+}
+
+func (rf *Raft) AppendEntry(args *RequestAppendEntry, reply *ReplyAppendEntry) {
+
 }
 
 //
@@ -189,11 +233,57 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+func (rf *Raft) sendRequestVote() {
+	// vote one is from me self
+	// incre term_
+	rf.current_term_++
+	rf.status_ = CANDIDATE
+
+	// prepare for rpc
+	args := RequestVoteArgs {
+		Term_: rf.current_term_,
+		CandidateId_: int32(rf.me),
+	}
+	reply := RequestVoteReply {
+		VoteGranted_: false,
+	}
+	
+	vote_get := 1
+	vote_chan := make(chan bool)
+	// request vote from peers 
+	rf.voted_for_ = int32(rf.me) // vote to myself
+	rf.ticker()
+	for idx, _ := range rf.peers {
+		if idx == rf.me { continue }
+		go func(idx int, reply_inside RequestVoteReply) {
+			ok := rf.peers[idx].Call("Raft.RequestVote", args, reply_inside)
+			if ok && reply_inside.VoteGranted_ {
+				vote_chan <- true
+			} 
+		} (idx, reply)
+	}
+
+	for idx, _ := range rf.peers {
+		if idx == rf.me { continue }
+		// gather vote
+		if vote_res := <- vote_chan; vote_res {
+			vote_get++
+		}
+
+		// check if valid to exit vote step
+		if vote_get > (len(rf.peers) / 2) {
+			rf.status_ = LEADER
+			go rf.sendHeartBeat()
+		}
+		if rf.status_ != CANDIDATE { 
+			break 
+		} 
+	}
 }
 
+func (rf *Raft) sendAppendEntry() {
+
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -243,13 +333,32 @@ func (rf *Raft) killed() bool {
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
+const (
+	HEARTBEAT_TIMEOUT = time.Millisecond * 100
+	MIN_ELECTION_TIMEOUT = time.Millisecond * 250
+	MAX_ELECTION_TIMEOUT = time.Millisecond * 500
+	ELECTION_TIME_GAP = MAX_ELECTION_TIMEOUT - MIN_ELECTION_TIMEOUT
+)
+
+func (rf *Raft) sendHeartBeat() {
+	time.Sleep(HEARTBEAT_TIMEOUT)
+	if rf.status_ == LEADER {
+		rf.sendAppendEntry()
+		go rf.sendHeartBeat()
+	}
+}
+
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
-		// time.Sleep().
-
+		// get timeout to sleep
+		time_to_sleep := MIN_ELECTION_TIMEOUT + (time.Duration(rand.Int()) % ELECTION_TIME_GAP)
+		time.Sleep(time_to_sleep)
+		// check heartbeat
+		if !rf.heartbeat_ {
+			rf.sendRequestVote()
+		}
 	}
 }
 
