@@ -56,19 +56,21 @@ type ApplyMsg struct {
 //
 
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
-	current_term_ RaftTermSyn
-	voted_for_ RaftVotedForSyn
-	status_ RaftStatusSyn
-	heartbeat_ RaftHeartbeatSyn
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	// NV states
+	current_term_ RaftMemberSync[int32]
+	voted_for_ RaftMemberSync[int32]
+	logs_ map[int]interface{}
+	log_mu_ sync.Mutex
+
+	// V states
+	status_ RaftMemberSync[RaftStatus]
+	heartbeat_ RaftMemberSync[bool]
 
 }
 
@@ -76,7 +78,7 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
-	return int(rf.ReadTerm()), rf.ReadStatus() == LEADER
+	return int(rf.current_term_.ReadMemberSync()), rf.status_.ReadMemberSync() == LEADER
 }
 
 //
@@ -139,57 +141,46 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
-func (rf *Raft) UpdateHeartbeat(new_heartbeat bool) {
-	rf.heartbeat_.mu.Lock()
-	defer rf.heartbeat_.mu.Unlock()
-	rf.heartbeat_.heartbeat = new_heartbeat
-}
-
-func (rf *Raft) ReadHeartbeat() bool {
-	rf.heartbeat_.mu.Lock()
-	defer rf.heartbeat_.mu.Unlock()
-	return rf.heartbeat_.heartbeat	
-}
-
 // rpc receiver
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// A: vote for not
-	if args.Term_ < rf.ReadTerm() {
-		reply.Term_ = rf.ReadTerm()
+	if args.Term_ < rf.current_term_.ReadMemberSync() {
+		reply.Term_ = rf.current_term_.ReadMemberSync()
 		reply.VoteGranted_ = false
-		DPrintf("server-%d vote to %d in term %d\n", rf.me, rf.ReadVotedFor(), rf.ReadTerm())
+		DPrintf("server-%d vote to %d in term %d\n", rf.me, rf.voted_for_.ReadMemberSync(), rf.current_term_.ReadMemberSync())
 		return
 	} 
 
 	// B: vote for yes
 	// update server info
-	if args.Term_ > rf.ReadTerm() {
-		rf.UpdateTerm(args.Term_)
-		rf.UpdateVotedFor(-1)
+	if args.Term_ > rf.current_term_.ReadMemberSync() {
+		rf.current_term_.UpdateMemberSync(args.Term_)
+		rf.status_.UpdateMemberSync(FOLLOWER)
+		rf.voted_for_.UpdateMemberSync(-1)
 	}
 
 	// do the vote
-	reply.Term_ = rf.ReadTerm()
-	voted_for := rf.ReadVotedFor()
+	reply.Term_ = rf.current_term_.ReadMemberSync()
+	voted_for := rf.voted_for_.ReadMemberSync()
 	if voted_for == args.CandidateId_ || voted_for == -1 {
-		rf.UpdateVotedFor(args.CandidateId_)
+		rf.voted_for_.UpdateMemberSync(args.CandidateId_)
 		reply.VoteGranted_ = true
 	} else {
 		reply.VoteGranted_ = false
 	}
-	DPrintf("server-%d vote to %d in term %d\n", rf.me, rf.ReadVotedFor(), rf.ReadTerm())
+	DPrintf("server-%d vote to %d in term %d\n", rf.me, rf.voted_for_.ReadMemberSync(), rf.current_term_.ReadMemberSync())
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	DPrintf("[FOLLOWER] %d AppendEntry\n", rf.me)
-	rf.UpdateHeartbeat(true)
-	if args.Term_ > rf.ReadTerm() {
-		rf.UpdateTerm(args.Term_)
+	rf.heartbeat_.UpdateMemberSync(true)
+	if args.Term_ > rf.current_term_.ReadMemberSync() {
+		rf.current_term_.UpdateMemberSync(args.Term_)
+		rf.status_.UpdateMemberSync(FOLLOWER)
 	}
 	reply.Success_ = true
-	reply.Term_ = rf.ReadTerm()
+	reply.Term_ = rf.current_term_.ReadMemberSync()
 }
 
 //
@@ -224,24 +215,24 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 func (rf *Raft) sendRequestVote() {
 	// vote one is from me self
 	// incre term_
-	rf.IncreTerm()
-	rf.UpdateStatus(CANDIDATE)
+	rf.current_term_.UpdateMemberSync(rf.current_term_.ReadMemberSync() + 1)
+	rf.status_.UpdateMemberSync(CANDIDATE)
 
 	// prepare for rpc
 	args := RequestVoteArgs {
-		Term_: rf.ReadTerm(),
+		Term_: rf.current_term_.ReadMemberSync(),
 		CandidateId_: int32(rf.me),
 	}
 	reply := RequestVoteReply {
 		VoteGranted_: false,
 	}
-	DPrintf("sendRequestVote sender: %d, term %d\n", rf.me, rf.ReadTerm())
+	DPrintf("sendRequestVote sender: %d, term %d\n", rf.me, rf.current_term_.ReadMemberSync())
 	
 	vote_get := 1
 	vote_chan := make(chan bool)
 	// request vote from peers 
-	rf.UpdateVotedFor(int32(rf.me))
-	for idx, _ := range rf.peers {
+	rf.voted_for_.UpdateMemberSync(int32(rf.me))
+	for idx := range rf.peers {
 		if idx == rf.me { continue }
 		go func(idx int, reply_inside RequestVoteReply) {
 			ok := rf.peers[idx].Call("Raft.RequestVote", &args, &reply_inside)
@@ -251,7 +242,7 @@ func (rf *Raft) sendRequestVote() {
 		} (idx, reply)
 	}
 
-	for idx, _ := range rf.peers {
+	for idx := range rf.peers {
 		if idx == rf.me { continue }
 		// gather vote
 		if vote_res := <- vote_chan; vote_res {
@@ -260,26 +251,26 @@ func (rf *Raft) sendRequestVote() {
 
 		// check if valid to exit vote step
 		if vote_get > (len(rf.peers) / 2) {
-			rf.UpdateStatus(LEADER)
+			rf.status_.UpdateMemberSync(LEADER)
 			go rf.sendHeartBeat()
 		}
-		if rf.ReadStatus() != CANDIDATE { 
+		if rf.status_.ReadMemberSync() != CANDIDATE { 
 			break 
 		} 
 	}
 }
 
 func (rf *Raft) sendAppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
-	DPrintf("sendAppendEntry, sender %d, term %d\n", rf.me, rf.ReadTerm())
+	DPrintf("sendAppendEntry, sender %d, term %d\n", rf.me, rf.current_term_.ReadMemberSync())
 	// send AppendEntry
 	append_entry_ch := make(chan bool)
-	for idx, _ := range rf.peers {
-		go func(idx int, reply_inside *AppendEntryReply) {
-			ok := rf.peers[idx].Call("Raft.AppendEntry", args, reply_inside)
+	for idx := range rf.peers {
+		go func(idx int, reply_inside AppendEntryReply) {
+			ok := rf.peers[idx].Call("Raft.AppendEntry", args, &reply_inside)
 			if ok {
 				append_entry_ch <- true
 			}
-		} (idx, reply)
+		} (idx, *reply)
 	}
 	
 	// TODO: deal with results
@@ -344,10 +335,10 @@ const (
 )
 
 func (rf *Raft) sendHeartBeat() {
-	for rf.ReadStatus() == LEADER {
+	for rf.status_.ReadMemberSync() == LEADER {
 		time.Sleep(HEARTBEAT_TIMEOUT)
 		args := AppendEntryArgs{
-			Term_: rf.ReadTerm(),
+			Term_: rf.current_term_.ReadMemberSync(),
 			LeaderId_: int32(rf.me),
 		}
 		reply := AppendEntryReply{}
@@ -356,15 +347,15 @@ func (rf *Raft) sendHeartBeat() {
 }
 
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// get timeout to sleep
 		time_to_sleep := MIN_ELECTION_TIMEOUT + (time.Duration(rand.Int()) % ELECTION_TIME_GAP)
-		rf.UpdateHeartbeat(false)
+		rf.heartbeat_.UpdateMemberSync(false)
 		time.Sleep(time_to_sleep)
 		// check heartbeat
-		if !rf.ReadHeartbeat() {
+		if !rf.heartbeat_.ReadMemberSync() {
 			go rf.sendRequestVote()
 		}
 	}
