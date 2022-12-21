@@ -60,17 +60,23 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// NV states
 	current_term_ RaftMemberSync[int32]
 	voted_for_ RaftMemberSync[int32]
-	logs_ map[int]interface{}
+	logs_ []LogEntry
 	log_mu_ sync.Mutex
 
 	// V states
 	status_ RaftMemberSync[RaftStatus]
 	heartbeat_ RaftMemberSync[bool]
+
+	commit_index RaftMemberSync[int32]
+	last_applied RaftMemberSync[int32]
+	next_index_ []RaftMemberSync[int32]
+	match_index_ []RaftMemberSync[int32]
 
 }
 
@@ -166,6 +172,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if voted_for == args.CandidateId_ || voted_for == -1 {
 		rf.voted_for_.UpdateMemberSync(args.CandidateId_)
 		reply.VoteGranted_ = true
+		// granting vote means a heartbeat
+		rf.heartbeat_.UpdateMemberSync(true)
 	} else {
 		reply.VoteGranted_ = false
 	}
@@ -173,14 +181,46 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
-	DPrintf("[FOLLOWER] %d AppendEntry\n", rf.me)
+	// DPrintf("[FOLLOWER] %d AppendEntry\n", rf.me)
 	rf.heartbeat_.UpdateMemberSync(true)
+	// update term if needed
 	if args.Term_ > rf.current_term_.ReadMemberSync() {
 		rf.current_term_.UpdateMemberSync(args.Term_)
 		rf.status_.UpdateMemberSync(FOLLOWER)
 	}
-	reply.Success_ = true
+
+	// deal with entries received
+	// 1. check current_term
+	// 2. check log consistency
+	reply.FollowerId_ = int32(rf.me)
 	reply.Term_ = rf.current_term_.ReadMemberSync()
+
+	rf.log_mu_.Lock()
+	defer rf.log_mu_.Unlock()
+	if (args.Term_ < rf.current_term_.ReadMemberSync()) ||
+		((len(rf.logs_) - 1) < int(args.PrevLogIndex_)) || 
+		(rf.logs_[len(rf.logs_)-1].Term_ != args.PrevLogTerm_ ) {
+		reply.Success_ = false
+		return
+	}
+	// update log: len(log) - 1 >= PrevLogIndex
+	for index, entry := range args.Entries {
+		index_in_log := args.PrevLogIndex_ + 1 + int32(index)
+		if (len(rf.logs_) > int(index_in_log)) && 
+			(rf.logs_[index_in_log] != entry) {
+			// truncate slice
+			rf.logs_ = rf.logs_[0:index_in_log]
+		} 
+		if len(rf.logs_) <= int(index_in_log) {
+			rf.logs_ = append(rf.logs_, entry)
+		}
+	}
+	if rf.commit_index.ReadMemberSync() < args.LeaderCommit_ {
+		rf.commit_index.UpdateMemberSync(
+			Min(args.LeaderCommit_, int32(len(rf.logs_) - 1)))
+	}
+	DPrintf("[Server] %d log: %v", rf.me, rf.logs_)
+	reply.Success_ = true
 }
 
 //
@@ -232,18 +272,18 @@ func (rf *Raft) sendRequestVote() {
 	vote_chan := make(chan bool)
 	// request vote from peers 
 	rf.voted_for_.UpdateMemberSync(int32(rf.me))
-	for idx := range rf.peers {
-		if idx == rf.me { continue }
-		go func(idx int, reply_inside RequestVoteReply) {
-			ok := rf.peers[idx].Call("Raft.RequestVote", &args, &reply_inside)
+	for p := range rf.peers {
+		if p == rf.me { continue }
+		go func(p int, reply_inside RequestVoteReply) {
+			ok := rf.peers[p].Call("Raft.RequestVote", &args, &reply_inside)
 			if ok && reply_inside.VoteGranted_ {
 				vote_chan <- true
 			} 
-		} (idx, reply)
+		} (p, reply)
 	}
 
-	for idx := range rf.peers {
-		if idx == rf.me { continue }
+	for p := range rf.peers {
+		if p == rf.me { continue }
 		// gather vote
 		if vote_res := <- vote_chan; vote_res {
 			vote_get++
@@ -252,6 +292,30 @@ func (rf *Raft) sendRequestVote() {
 		// check if valid to exit vote step
 		if vote_get > (len(rf.peers) / 2) {
 			rf.status_.UpdateMemberSync(LEADER)
+			rf.log_mu_.Lock()
+			for index := 0; index < len(rf.peers); index++ {
+				// init nextIndex
+				if len(rf.next_index_) <= index {
+					rf.next_index_ = append(rf.next_index_, RaftMemberSync[int32]{
+						member: int32(len(rf.logs_)),
+					})
+				} else {
+					rf.next_index_[index] = RaftMemberSync[int32]{
+						member: int32(len(rf.logs_)),
+					}
+				}
+				// init matchIndex
+				if len(rf.match_index_) <= index {
+					rf.match_index_ = append(rf.match_index_, RaftMemberSync[int32]{
+						member: 0,
+					})
+				} else {
+					rf.match_index_[index] = RaftMemberSync[int32]{
+						member: 0,
+					}
+				}
+			}
+			rf.log_mu_.Unlock()
 			go rf.sendHeartBeat()
 		}
 		if rf.status_.ReadMemberSync() != CANDIDATE { 
@@ -261,22 +325,39 @@ func (rf *Raft) sendRequestVote() {
 }
 
 func (rf *Raft) sendAppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
-	DPrintf("sendAppendEntry, sender %d, term %d\n", rf.me, rf.current_term_.ReadMemberSync())
+	// DPrintf("sendAppendEntry, sender %d, term %d\n", rf.me, rf.current_term_.ReadMemberSync())
 	// send AppendEntry
-	append_entry_ch := make(chan bool)
-	for idx := range rf.peers {
-		go func(idx int, reply_inside AppendEntryReply) {
-			ok := rf.peers[idx].Call("Raft.AppendEntry", args, &reply_inside)
+	append_entry_ch := make(chan AppendEntryReply)
+	for p := range rf.peers {
+		go func(p int, reply_inside AppendEntryReply) {
+			ok := rf.peers[p].Call("Raft.AppendEntry", args, &reply_inside)
 			if ok {
-				append_entry_ch <- true
+				append_entry_ch <- reply_inside 
 			}
-		} (idx, *reply)
+		} (p, *reply)
 	}
 	
 	// TODO: deal with results
-	for _, _ = range rf.peers {
-		_ = <- append_entry_ch
+	success_cnt := 0
+	for range rf.peers {
+		reply := <- append_entry_ch
+		// update term if needed
+		if reply.Term_ > rf.current_term_.ReadMemberSync() {
+			rf.current_term_.UpdateMemberSync(reply.Term_)
+			rf.status_.UpdateMemberSync(FOLLOWER)
+		}
+		if !reply.Success_ {
+			go rf.dealAppendFail(&reply)
+		} else {
+			success_cnt++
+		}
+
 	}
+}
+
+func (rf *Raft) dealAppendFail(reply *AppendEntryReply) {
+	// communicate to follower
+
 }
 
 //
@@ -294,14 +375,38 @@ func (rf *Raft) sendAppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) 
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	isLeader := rf.status_.ReadMemberSync() == LEADER
 
 	// Your code here (2B).
+	// Leader path
+	if isLeader {
+		log_entry := LogEntry{
+			Term_: rf.current_term_.ReadMemberSync(),
+			Cmd_: command,
+		}
+		// append log
+		rf.log_mu_.Lock()
+		args := AppendEntryArgs{
+			Term_: rf.current_term_.ReadMemberSync(),
+			LeaderId_: int32(rf.me),
 
+			PrevLogIndex_: int32(len(rf.logs_)) - 1,
+			PrevLogTerm_: rf.logs_[len(rf.logs_)-1].Term_,
+			
+			Entries: []LogEntry{log_entry},
+			LeaderCommit_: rf.commit_index.ReadMemberSync(),
+		}
+		reply := AppendEntryReply {
+			Success_: false,
+		}
+		rf.logs_ = append(rf.logs_, log_entry)
+		rf.log_mu_.Unlock()
 
-	return index, term, isLeader
+		// append entry to peers
+		rf.sendAppendEntry(&args, &reply)
+	} 
+	// follower(no-leader) path
+	return len(rf.logs_) - 1, int(rf.current_term_.ReadMemberSync()), isLeader
 }
 
 //
@@ -378,8 +483,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.log_mu_.Lock()
+	rf.logs_ = append(rf.logs_, LogEntry{
+		Cmd_: 0,
+		Term_: 0,
+	})
+	rf.log_mu_.Unlock()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

@@ -4,6 +4,11 @@ import "sync"
 
 type RaftStatus int32
 
+type LogEntry struct {
+	Term_ int32
+	Cmd_ interface{}
+}
+
 const (
 	FOLLOWER = RaftStatus(0)
 	CANDIDATE = RaftStatus(1)
@@ -51,11 +56,12 @@ type AppendEntryArgs struct {
 
 	PrevLogIndex_ int32
 	PrevLogTerm_ int32
-	Entries []interface{}
+	Entries []LogEntry
 	LeaderCommit_ int32
 }
 
 type AppendEntryReply struct {
+	FollowerId_ int32
 	Term_ int32
 	Success_ bool
 }
