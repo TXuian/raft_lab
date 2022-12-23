@@ -66,7 +66,7 @@ type Raft struct {
 	// NV states
 	current_term_ RaftMemberSync[int32]
 	voted_for_ RaftMemberSync[int32]
-	logs_ []LogEntry
+	logs []LogEntry
 	log_mu_ sync.Mutex
 
 	// V states
@@ -154,7 +154,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term_ < rf.current_term_.ReadMemberSync() {
 		reply.Term_ = rf.current_term_.ReadMemberSync()
 		reply.VoteGranted_ = false
-		DPrintf("server-%d vote to %d in term %d\n", rf.me, rf.voted_for_.ReadMemberSync(), rf.current_term_.ReadMemberSync())
+		DPrintf("[Server] %d vote to %d in term %d\n", rf.me, rf.voted_for_.ReadMemberSync(), rf.current_term_.ReadMemberSync())
 		return
 	} 
 
@@ -177,11 +177,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		reply.VoteGranted_ = false
 	}
-	DPrintf("server-%d vote to %d in term %d\n", rf.me, rf.voted_for_.ReadMemberSync(), rf.current_term_.ReadMemberSync())
+	DPrintf("[Server] %d vote to %d in term %d\n", rf.me, rf.voted_for_.ReadMemberSync(), rf.current_term_.ReadMemberSync())
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
-	// DPrintf("[FOLLOWER] %d AppendEntry\n", rf.me)
+	DPrintf("[Follower] %d receive appendentry, %v\n", rf.me, args.Entries)
 	rf.heartbeat_.UpdateMemberSync(true)
 	// update term if needed
 	if args.Term_ > rf.current_term_.ReadMemberSync() {
@@ -198,28 +198,28 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.log_mu_.Lock()
 	defer rf.log_mu_.Unlock()
 	if (args.Term_ < rf.current_term_.ReadMemberSync()) ||
-		((len(rf.logs_) - 1) < int(args.PrevLogIndex_)) || 
-		(rf.logs_[len(rf.logs_)-1].Term_ != args.PrevLogTerm_ ) {
+		((len(rf.logs) - 1) < int(args.PrevLogIndex_)) || 
+		(rf.logs[len(rf.logs)-1].Term_ != args.PrevLogTerm_ ) {
 		reply.Success_ = false
 		return
 	}
 	// update log: len(log) - 1 >= PrevLogIndex
 	for index, entry := range args.Entries {
 		index_in_log := args.PrevLogIndex_ + 1 + int32(index)
-		if (len(rf.logs_) > int(index_in_log)) && 
-			(rf.logs_[index_in_log] != entry) {
+		if (len(rf.logs) > int(index_in_log)) && 
+			(rf.logs[index_in_log] != entry) {
 			// truncate slice
-			rf.logs_ = rf.logs_[0:index_in_log]
+			rf.logs = rf.logs[0:index_in_log]
 		} 
-		if len(rf.logs_) <= int(index_in_log) {
-			rf.logs_ = append(rf.logs_, entry)
+		if len(rf.logs) <= int(index_in_log) {
+			rf.logs = append(rf.logs, entry)
 		}
 	}
 	if rf.commit_index.ReadMemberSync() < args.LeaderCommit_ {
 		rf.commit_index.UpdateMemberSync(
-			Min(args.LeaderCommit_, int32(len(rf.logs_) - 1)))
+			Min(args.LeaderCommit_, int32(len(rf.logs) - 1)))
 	}
-	DPrintf("[Server] %d log: %v", rf.me, rf.logs_)
+	// DPrintf("[Server] %d log: %v", rf.me, rf.logs)
 	reply.Success_ = true
 }
 
@@ -268,7 +268,7 @@ func (rf *Raft) sendRequestVote() {
 	}
 	DPrintf("sendRequestVote sender: %d, term %d\n", rf.me, rf.current_term_.ReadMemberSync())
 	
-	vote_get := 1
+	vote_get := 0
 	vote_chan := make(chan bool)
 	// request vote from peers 
 	rf.voted_for_.UpdateMemberSync(int32(rf.me))
@@ -292,30 +292,6 @@ func (rf *Raft) sendRequestVote() {
 		// check if valid to exit vote step
 		if vote_get > (len(rf.peers) / 2) {
 			rf.status_.UpdateMemberSync(LEADER)
-			rf.log_mu_.Lock()
-			for index := 0; index < len(rf.peers); index++ {
-				// init nextIndex
-				if len(rf.next_index_) <= index {
-					rf.next_index_ = append(rf.next_index_, RaftMemberSync[int32]{
-						member: int32(len(rf.logs_)),
-					})
-				} else {
-					rf.next_index_[index] = RaftMemberSync[int32]{
-						member: int32(len(rf.logs_)),
-					}
-				}
-				// init matchIndex
-				if len(rf.match_index_) <= index {
-					rf.match_index_ = append(rf.match_index_, RaftMemberSync[int32]{
-						member: 0,
-					})
-				} else {
-					rf.match_index_[index] = RaftMemberSync[int32]{
-						member: 0,
-					}
-				}
-			}
-			rf.log_mu_.Unlock()
 			go rf.sendHeartBeat()
 		}
 		if rf.status_.ReadMemberSync() != CANDIDATE { 
@@ -325,7 +301,7 @@ func (rf *Raft) sendRequestVote() {
 }
 
 func (rf *Raft) sendAppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
-	// DPrintf("sendAppendEntry, sender %d, term %d\n", rf.me, rf.current_term_.ReadMemberSync())
+	DPrintf("[Leader] sendAppendEntry, sender %d, term %d, entries: %v\n", rf.me, rf.current_term_.ReadMemberSync(), args.Entries)
 	// send AppendEntry
 	append_entry_ch := make(chan AppendEntryReply)
 	for p := range rf.peers {
@@ -340,25 +316,72 @@ func (rf *Raft) sendAppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) 
 	// TODO: deal with results
 	success_cnt := 0
 	for range rf.peers {
-		reply := <- append_entry_ch
+		cur_reply := <- append_entry_ch
+		if cur_reply.FollowerId_ == int32(rf.me) {
+			continue
+		}
 		// update term if needed
-		if reply.Term_ > rf.current_term_.ReadMemberSync() {
-			rf.current_term_.UpdateMemberSync(reply.Term_)
-			rf.status_.UpdateMemberSync(FOLLOWER)
-		}
-		if !reply.Success_ {
-			go rf.dealAppendFail(&reply)
-		} else {
-			success_cnt++
-		}
-
+		rf.dealAppendResult(args, &cur_reply, &success_cnt)
 	}
 }
 
-func (rf *Raft) dealAppendFail(reply *AppendEntryReply) {
+func (rf *Raft) sendSingleAppendEntry(peer int32, args *AppendEntryArgs, reply *AppendEntryReply) {
+	ok := false
+	for !ok {
+		ok := rf.peers[peer].Call("Raft.AppendEntry", args, reply)
+		if ok {
+			junk := 0
+			rf.dealAppendResult(args, reply, &junk)
+		}
+	}
+}
+
+func (rf *Raft) dealAppendResult(args *AppendEntryArgs, reply *AppendEntryReply, success_cnt *int) {
+	if reply.Term_ > rf.current_term_.ReadMemberSync() {
+		rf.current_term_.UpdateMemberSync(reply.Term_)
+		rf.status_.UpdateMemberSync(FOLLOWER)
+	}
+	if !reply.Success_ {
+		go rf.dealAppendFail(args, *reply)
+	} else {
+		*success_cnt++
+	}
+	if (*success_cnt > len(rf.peers) / 2) && (len(args.Entries) != 0) {
+		// DPrintf("[Leader] Apply commit, %v\n", args.Entries)
+		if rf.commit_index.ReadMemberSync() <= args.PrevLogIndex_ {
+			rf.commit_index.UpdateMemberSync(args.PrevLogIndex_ + int32(len(args.Entries)))
+		}
+		*success_cnt = 0
+	}
+}
+
+func (rf *Raft) dealAppendFail(args *AppendEntryArgs, reply AppendEntryReply) {
 	// communicate to follower
+	DPrintf("[Leader] dealAppendFail to %d\n", reply.FollowerId_)
+	if args.PrevLogIndex_ == 0 {
+		return
+	}
+	// update args
+	rf.log_mu_.Lock()
+	new_entries := []LogEntry {
+		rf.logs[args.PrevLogIndex_],
+	}
+	new_entries = append(new_entries, args.Entries...)
+	new_args := AppendEntryArgs {
+		Term_: args.Term_,
+		LeaderId_: args.LeaderId_,
+
+		PrevLogIndex_: args.PrevLogIndex_ - 1,
+		PrevLogTerm_: rf.logs[args.PrevLogIndex_ - 1].Term_,
+
+		Entries: new_entries,
+		LeaderCommit_: rf.commit_index.ReadMemberSync(),
+	}
+	rf.log_mu_.Unlock()
+	rf.sendSingleAppendEntry(reply.FollowerId_, &new_args, &reply)
 
 }
+
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -379,19 +402,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	// Leader path
+	rf.log_mu_.Lock()
+	defer rf.log_mu_.Unlock()
 	if isLeader {
 		log_entry := LogEntry{
 			Term_: rf.current_term_.ReadMemberSync(),
 			Cmd_: command,
 		}
 		// append log
-		rf.log_mu_.Lock()
 		args := AppendEntryArgs{
 			Term_: rf.current_term_.ReadMemberSync(),
 			LeaderId_: int32(rf.me),
 
-			PrevLogIndex_: int32(len(rf.logs_)) - 1,
-			PrevLogTerm_: rf.logs_[len(rf.logs_)-1].Term_,
+			PrevLogIndex_: int32(len(rf.logs)) - 1,
+			PrevLogTerm_: rf.logs[len(rf.logs)-1].Term_,
 			
 			Entries: []LogEntry{log_entry},
 			LeaderCommit_: rf.commit_index.ReadMemberSync(),
@@ -399,14 +423,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		reply := AppendEntryReply {
 			Success_: false,
 		}
-		rf.logs_ = append(rf.logs_, log_entry)
-		rf.log_mu_.Unlock()
+		rf.logs = append(rf.logs, log_entry)
 
 		// append entry to peers
-		rf.sendAppendEntry(&args, &reply)
+		go rf.sendAppendEntry(&args, &reply)
 	} 
 	// follower(no-leader) path
-	return len(rf.logs_) - 1, int(rf.current_term_.ReadMemberSync()), isLeader
+	return len(rf.logs) - 1, int(rf.current_term_.ReadMemberSync()), isLeader
 }
 
 //
@@ -434,20 +457,46 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 const (
 	HEARTBEAT_TIMEOUT = time.Millisecond * 100
-	MIN_ELECTION_TIMEOUT = time.Millisecond * 200
-	MAX_ELECTION_TIMEOUT = time.Millisecond * 400
+	MIN_ELECTION_TIMEOUT = time.Millisecond * 300
+	MAX_ELECTION_TIMEOUT = time.Millisecond * 500
 	ELECTION_TIME_GAP = MAX_ELECTION_TIMEOUT - MIN_ELECTION_TIMEOUT
 )
+
+func (rf *Raft) commitEntries() {
+old_commit_index := 1
+	for !rf.killed() {
+		// sleep
+		time.Sleep(HEARTBEAT_TIMEOUT)
+		// commit entries 
+		rf.log_mu_.Lock()
+		for int32(old_commit_index) <= rf.commit_index.ReadMemberSync() {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command: rf.logs[old_commit_index].Cmd_,
+				CommandIndex: old_commit_index,
+			} 
+			old_commit_index++
+		}
+		rf.log_mu_.Unlock()
+	}
+}
 
 func (rf *Raft) sendHeartBeat() {
 	for rf.status_.ReadMemberSync() == LEADER {
 		time.Sleep(HEARTBEAT_TIMEOUT)
+		rf.log_mu_.Lock()
 		args := AppendEntryArgs{
 			Term_: rf.current_term_.ReadMemberSync(),
 			LeaderId_: int32(rf.me),
+
+			PrevLogIndex_: int32(len(rf.logs)) - 1,
+			PrevLogTerm_: rf.logs[len(rf.logs)-1].Term_,
+			
+			LeaderCommit_: rf.commit_index.ReadMemberSync(),
 		}
+		rf.log_mu_.Unlock()
 		reply := AppendEntryReply{}
-		rf.sendAppendEntry(&args, &reply)
+		go rf.sendAppendEntry(&args, &reply)
 	}
 }
 
@@ -487,7 +536,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.log_mu_.Lock()
-	rf.logs_ = append(rf.logs_, LogEntry{
+	rf.logs = append(rf.logs, LogEntry{
 		Cmd_: 0,
 		Term_: 0,
 	})
@@ -498,6 +547,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.commitEntries()
 
 
 	return rf
