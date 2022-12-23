@@ -154,7 +154,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term_ < rf.current_term_.ReadMemberSync() {
 		reply.Term_ = rf.current_term_.ReadMemberSync()
 		reply.VoteGranted_ = false
-		DPrintf("[Server] %d vote to %d in term %d\n", rf.me, rf.voted_for_.ReadMemberSync(), rf.current_term_.ReadMemberSync())
+		//DPrintf("[Server] %d vote to %d in term %d\n", rf.me, rf.voted_for_.ReadMemberSync(), rf.current_term_.ReadMemberSync())
 		return
 	} 
 
@@ -177,11 +177,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		reply.VoteGranted_ = false
 	}
-	DPrintf("[Server] %d vote to %d in term %d\n", rf.me, rf.voted_for_.ReadMemberSync(), rf.current_term_.ReadMemberSync())
+	//DPrintf("[Server] %d vote to %d in term %d\n", rf.me, rf.voted_for_.ReadMemberSync(), rf.current_term_.ReadMemberSync())
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
-	DPrintf("[Follower] %d receive appendentry, %v\n", rf.me, args.Entries)
+	// DPrintf("[Follower] %d receive appendentry, %v\n", rf.me, args)
+	//DPrintf("[Follower] %d logs: %v\n", rf.me, rf.logs)
 	rf.heartbeat_.UpdateMemberSync(true)
 	// update term if needed
 	if args.Term_ > rf.current_term_.ReadMemberSync() {
@@ -206,9 +207,13 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// update log: len(log) - 1 >= PrevLogIndex
 	for index, entry := range args.Entries {
 		index_in_log := args.PrevLogIndex_ + 1 + int32(index)
+		// DPrintf("[Follower] %d, log: %v, index_in_log: %d\n", rf.me, rf.logs, index_in_log)
 		if (len(rf.logs) > int(index_in_log)) && 
 			(rf.logs[index_in_log] != entry) {
 			// truncate slice
+			// DPrintf("[Follower] %d receive appendentry, %v\n", rf.me, args)
+			// DPrintf("[Follower] %d logs: %v\n", rf.me, rf.logs)
+
 			rf.logs = rf.logs[0:index_in_log]
 		} 
 		if len(rf.logs) <= int(index_in_log) {
@@ -219,7 +224,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.commit_index.UpdateMemberSync(
 			Min(args.LeaderCommit_, int32(len(rf.logs) - 1)))
 	}
-	// DPrintf("[Server] %d log: %v", rf.me, rf.logs)
+	// DPrintf("[Server] %d, args: %v, log: %v, commit idx: %d", rf.me, args, rf.logs, rf.commit_index.ReadMemberSync())
 	reply.Success_ = true
 }
 
@@ -266,9 +271,9 @@ func (rf *Raft) sendRequestVote() {
 	reply := RequestVoteReply {
 		VoteGranted_: false,
 	}
-	DPrintf("sendRequestVote sender: %d, term %d\n", rf.me, rf.current_term_.ReadMemberSync())
+	//DPrintf("sendRequestVote sender: %d, term %d\n", rf.me, rf.current_term_.ReadMemberSync())
 	
-	vote_get := 0
+	vote_get := 1
 	vote_chan := make(chan bool)
 	// request vote from peers 
 	rf.voted_for_.UpdateMemberSync(int32(rf.me))
@@ -301,7 +306,7 @@ func (rf *Raft) sendRequestVote() {
 }
 
 func (rf *Raft) sendAppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
-	DPrintf("[Leader] sendAppendEntry, sender %d, term %d, entries: %v\n", rf.me, rf.current_term_.ReadMemberSync(), args.Entries)
+	//DPrintf("[Leader] sendAppendEntry, sender %d, term %d, entries: %v\n", rf.me, rf.current_term_.ReadMemberSync(), args.Entries)
 	// send AppendEntry
 	append_entry_ch := make(chan AppendEntryReply)
 	for p := range rf.peers {
@@ -314,7 +319,7 @@ func (rf *Raft) sendAppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) 
 	}
 	
 	// TODO: deal with results
-	success_cnt := 0
+	success_cnt := 1
 	for range rf.peers {
 		cur_reply := <- append_entry_ch
 		if cur_reply.FollowerId_ == int32(rf.me) {
@@ -330,8 +335,13 @@ func (rf *Raft) sendSingleAppendEntry(peer int32, args *AppendEntryArgs, reply *
 	for !ok {
 		ok := rf.peers[peer].Call("Raft.AppendEntry", args, reply)
 		if ok {
-			junk := 0
-			rf.dealAppendResult(args, reply, &junk)
+			if reply.Term_ > rf.current_term_.ReadMemberSync() {
+				rf.current_term_.UpdateMemberSync(reply.Term_)
+				rf.status_.UpdateMemberSync(FOLLOWER)
+			}
+			if !reply.Success_ {
+				rf.dealAppendFail(args, *reply)
+			}
 		}
 	}
 }
@@ -347,9 +357,9 @@ func (rf *Raft) dealAppendResult(args *AppendEntryArgs, reply *AppendEntryReply,
 		*success_cnt++
 	}
 	if (*success_cnt > len(rf.peers) / 2) && (len(args.Entries) != 0) {
-		// DPrintf("[Leader] Apply commit, %v\n", args.Entries)
+		// //DPrintf("[Leader] Apply commit, %v\n", args.Entries)
 		if rf.commit_index.ReadMemberSync() <= args.PrevLogIndex_ {
-			rf.commit_index.UpdateMemberSync(args.PrevLogIndex_ + int32(len(args.Entries)))
+			rf.commit_index.UpdateMemberSync(Min(int32(len(rf.logs)) - 1, args.PrevLogIndex_ + int32(len(args.Entries))))
 		}
 		*success_cnt = 0
 	}
@@ -357,7 +367,7 @@ func (rf *Raft) dealAppendResult(args *AppendEntryArgs, reply *AppendEntryReply,
 
 func (rf *Raft) dealAppendFail(args *AppendEntryArgs, reply AppendEntryReply) {
 	// communicate to follower
-	DPrintf("[Leader] dealAppendFail to %d\n", reply.FollowerId_)
+	//DPrintf("[Leader] dealAppendFail to %d\n", reply.FollowerId_)
 	if args.PrevLogIndex_ == 0 {
 		return
 	}
@@ -379,7 +389,6 @@ func (rf *Raft) dealAppendFail(args *AppendEntryArgs, reply AppendEntryReply) {
 	}
 	rf.log_mu_.Unlock()
 	rf.sendSingleAppendEntry(reply.FollowerId_, &new_args, &reply)
-
 }
 
 
@@ -463,21 +472,24 @@ const (
 )
 
 func (rf *Raft) commitEntries() {
-old_commit_index := 1
+	old_commit_index := 1
 	for !rf.killed() {
 		// sleep
 		time.Sleep(HEARTBEAT_TIMEOUT)
 		// commit entries 
-		rf.log_mu_.Lock()
 		for int32(old_commit_index) <= rf.commit_index.ReadMemberSync() {
-			rf.applyCh <- ApplyMsg{
+			//DPrintf("[Server] %d commit %v\n", rf.me, rf.logs[old_commit_index])
+			rf.log_mu_.Lock()
+			apply_msg := ApplyMsg{
 				CommandValid: true,
 				Command: rf.logs[old_commit_index].Cmd_,
-				CommandIndex: old_commit_index,
-			} 
+				CommandIndex: int(old_commit_index),
+			}
+			rf.log_mu_.Unlock()
+			rf.applyCh <- apply_msg
+			DPrintf("[Server] %d Commited %v, %d", rf.me, rf.logs[old_commit_index], old_commit_index)
 			old_commit_index++
 		}
-		rf.log_mu_.Unlock()
 	}
 }
 
