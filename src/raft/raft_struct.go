@@ -1,6 +1,61 @@
 package raft
 
-import "sync"
+import (
+	"sync"
+
+	"6.824/labrpc"
+)
+
+//
+// as each Raft peer becomes aware that successive log entries are
+// committed, the peer should send an ApplyMsg to the service (or
+// tester) on the same server, via the applyCh passed to Make(). set
+// CommandValid to true to indicate that the ApplyMsg contains a newly
+// committed log entry.
+//
+// in part 2D you'll want to send other kinds of messages (e.g.,
+// snapshots) on the applyCh, but set CommandValid to false for these
+// other uses.
+//
+type ApplyMsg struct {
+	CommandValid bool
+	Command      interface{}
+	CommandIndex int
+
+	// For 2D:
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotTerm  int
+	SnapshotIndex int
+}
+
+//
+// A Go object implementing a single Raft peer.
+//
+type Raft struct {
+	peers     []*labrpc.ClientEnd // RPC end points of all peers
+	persister *Persister          // Object to hold this peer's persisted state
+	me        int                 // this peer's index into peers[]
+	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
+
+	// Your data here (2A, 2B, 2C).
+	// NV states
+	current_term_ RaftMemberSync[int32]
+	voted_for_ RaftMemberSync[int32]
+	logs []LogEntry
+
+	// V states
+	log_mu_ sync.Mutex
+	status_ RaftMemberSync[RaftStatus]
+	heartbeat_ RaftMemberSync[bool]
+
+	commit_index RaftMemberSync[int32]
+	last_applied RaftMemberSync[int32]
+	next_index_ []RaftMemberSync[int32]
+	match_index_ []RaftMemberSync[int32]
+
+}
 
 type RaftStatus int32
 
@@ -42,6 +97,9 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	CandidateId_ int32
 	Term_ int32
+
+	LastLogIndex_ int32
+	LastLogTerm_ int32
 }
 
 type RequestVoteReply struct {
@@ -61,7 +119,6 @@ type AppendEntryArgs struct {
 }
 
 type AppendEntryReply struct {
-	FollowerId_ int32
 	Term_ int32
 	Success_ bool
 }
