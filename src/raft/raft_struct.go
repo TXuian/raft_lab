@@ -121,4 +121,9 @@ type AppendEntryArgs struct {
 type AppendEntryReply struct {
 	Term_ int32
 	Success_ bool
+
+	// Find comflict entry
+	XTerm_ int32
+	XIndex_ int32
+	XLen_ int32
 }

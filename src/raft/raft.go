@@ -44,20 +44,26 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
-
 	stream := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(stream)
-	encoder.Encode(rf.current_term_.ReadMemberSync())
-	encoder.Encode(rf.voted_for_.ReadMemberSync())
-	encoder.Encode(rf.logs)
+
+	// encode data
+	err := encoder.Encode(rf.current_term_.ReadMemberSync())
+	if err != nil {
+		DPrintf("[Persist] Encode term err: %v\n", err)
+	}
+	err = encoder.Encode(rf.voted_for_.ReadMemberSync())
+	if err != nil {
+		DPrintf("[Persist] voted_for err: %v\n", err)
+	}
+	err = encoder.Encode(rf.logs)
+	if err != nil {
+		DPrintf("[Persist] logs err: %v\n", err)
+	}
+
+	// save data
 	data := stream.Bytes()
+	// DPrintf("[Persist] data: %v", data)
 	rf.persister.SaveRaftState(data)
 }
 
@@ -69,19 +75,6 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
-
 	stream := bytes.NewBuffer(data)
 	decoder := labgob.NewDecoder(stream)
 
@@ -91,14 +84,15 @@ func (rf *Raft) readPersist(data []byte) {
 
 	rf.log_mu_.Lock()
 	defer rf.log_mu_.Unlock()
-	if decoder.Decode(current_term) != nil ||
-		decoder.Decode(voted_for) != nil ||
-		decoder.Decode(logs) != nil {
-		DPrintf("[Persister] error read persist state.\n")
+	if decoder.Decode(&current_term) != nil ||
+		decoder.Decode(&voted_for) != nil ||
+		decoder.Decode(&logs) != nil {
+		DPrintf("[Err] readRersist err.\n")
 	} else {
 		rf.current_term_.UpdateMemberSync(current_term)
 		rf.voted_for_.UpdateMemberSync(voted_for)
 		rf.logs = logs
+		// DPrintf("[ReadPersist] %d, term: %d, voteFor: %v, log: %v", rf.me, current_term, voted_for, logs)
 	}
 }
 
@@ -108,7 +102,6 @@ func (rf *Raft) readPersist(data []byte) {
 // have more recent info since it communicate the snapshot on applyCh.
 //
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
 	// Your code here (2D).
 
 	return true
@@ -181,25 +174,41 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// deal with entries received
 	// 1. check current_term
 	// 2. check log consistency
+	reply.Success_ = false
 	reply.Term_ = rf.current_term_.ReadMemberSync()
+	if args.Term_ < rf.current_term_.ReadMemberSync() {
+		return 
+	}
 
 	rf.log_mu_.Lock()
 	defer rf.log_mu_.Unlock()
-	if (args.Term_ < rf.current_term_.ReadMemberSync()) ||
-		((len(rf.logs) - 1) < int(args.PrevLogIndex_)) || 
-		(rf.logs[args.PrevLogIndex_].Term_ != args.PrevLogTerm_ ) {
-		reply.Success_ = false
+	if int(args.PrevLogIndex_) >= len(rf.logs) {
+		// find comflict entry
+		reply.XTerm_ = -1
+		reply.XIndex_ = int32(len(rf.logs)) - 1
+		
+		if len(args.Entries) != 0 {
+			DPrintf("S%d AppendEntry failed, arg: %v, reply: %v, logs: %v\n", rf.me, args, reply, rf.logs)
+		}
+
+		return 
+	}
+	if rf.logs[args.PrevLogIndex_].Term_ != args.PrevLogTerm_ {
+		reply.XTerm_ = rf.logs[args.PrevLogIndex_].Term_
+		for entry_idx := range rf.logs {
+			if rf.logs[entry_idx].Term_ == reply.XTerm_ {
+				reply.XIndex_ = int32(entry_idx)
+				break
+			}
+		}
+		
+		if len(args.Entries) != 0 {
+			DPrintf("S%d AppendEntry failed, arg: %v, reply: %v, logs: %v\n", rf.me, args, reply, rf.logs)
+		}
+		
 		return
 	}
 	// update log: len(log) - 1 >= PrevLogIndex
-	if (int(args.PrevLogIndex_) >= len(rf.logs)) ||
-		(rf.logs[args.PrevLogIndex_].Term_ != args.PrevLogTerm_) {
-		if int(args.PrevLogIndex_) < len(rf.logs) {
-			rf.logs = rf.logs[0:args.PrevLogIndex_]
-			rf.persist()
-		}	
-		return
-	}
 	rf.logs = append(rf.logs[0: args.PrevLogIndex_ + 1], args.Entries...)
 	rf.persist()
 
@@ -247,6 +256,7 @@ func (rf *Raft) sendRequestVote() {
 	rf.status_.UpdateMemberSync(CANDIDATE)
 
 	// prepare for rpc
+	// DPrintf("S%d for leader, log: %v", rf.me, rf.logs)
 	rf.log_mu_.Lock()
 	args := RequestVoteArgs {
 		Term_: rf.current_term_.ReadMemberSync(),
@@ -353,29 +363,46 @@ func (rf *Raft) sendAppendEntry() {
 			ok := rf.peers[p].Call("Raft.AppendEntry", &args, &reply_inside)
 			
 			rf.log_mu_.Lock()
+			defer rf.log_mu_.Unlock()
 			if ok && reply_inside.Success_ {
+				// success reply
 				rf.match_index_[p].UpdateMemberSync(args.PrevLogIndex_ + int32(len(args.Entries)))
 				rf.next_index_[p].UpdateMemberSync(rf.match_index_[p].ReadMemberSync() + 1)
 
 				majority_index_ := getMajoritySameIndex(rf.match_index_)
-				// if (rf.logs[majority_index_].Term_ == rf.current_term_.ReadMemberSync()) && 
-				// 	(majority_index_ > int(rf.commit_index.ReadMemberSync())) {
-				if majority_index_ > int(rf.commit_index.ReadMemberSync()) {
+				if (rf.logs[majority_index_].Term_ == rf.current_term_.ReadMemberSync()) && 
+					(majority_index_ > int(rf.commit_index.ReadMemberSync())) {
 					rf.commit_index.UpdateMemberSync(int32(majority_index_))
 				}
 			} else{ 
+				// failed reply
+				// 1. update term if needed.
 				if reply_inside.Term_ > rf.current_term_.ReadMemberSync() {
 					rf.current_term_.UpdateMemberSync(reply.Term_)
 					rf.persist()
 					rf.status_.UpdateMemberSync(FOLLOWER)
+					return
 				}
-				old_next_index := rf.next_index_[p].ReadMemberSync() - 1
-				if old_next_index < 1 {
-					old_next_index = 1
+				// 2. update next_index_[p] 
+				if reply_inside.XTerm_ == -1 {
+					rf.next_index_[p].UpdateMemberSync(reply_inside.XIndex_)
+				} else {	
+					new_next_index := -1
+					for i := len(rf.logs) - 1; i >= 0; i-- {
+						if rf.logs[i].Term_ == reply_inside.XTerm_ {
+							new_next_index = i
+							break
+						}
+					}
+					if new_next_index == -1 {
+						new_next_index = int(reply_inside.XIndex_)
+					} else {
+						new_next_index += 1
+					}	
+					rf.next_index_[p].UpdateMemberSync(int32(new_next_index))
 				}
-				rf.next_index_[p].UpdateMemberSync(old_next_index) 
+
 			}
-			rf.log_mu_.Unlock()
 		} (p, reply)
 	}
 	
@@ -439,7 +466,7 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 const (
-	HEARTBEAT_TIMEOUT = time.Millisecond * 70
+	HEARTBEAT_TIMEOUT = time.Millisecond * 100
 	MIN_ELECTION_TIMEOUT = time.Millisecond * 150
 	MAX_ELECTION_TIMEOUT = time.Millisecond * 300
 	ELECTION_TIME_GAP = MAX_ELECTION_TIMEOUT - MIN_ELECTION_TIMEOUT
@@ -513,7 +540,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Term_: 0,
 	})
 	rf.log_mu_.Unlock()
-	rf.persist()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
