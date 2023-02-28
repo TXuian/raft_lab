@@ -13,7 +13,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-func Min[T int32 | float32](left T, right T) T {
+func Min[T int32 | float32 | int ](left T, right T) T {
 	if left < right { return left }
 	return right
 }

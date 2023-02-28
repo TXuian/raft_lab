@@ -41,8 +41,8 @@ type Raft struct {
 
 	// Your data here (2A, 2B, 2C).
 	// NV states
-	current_term_ RaftMemberSync[int32]
-	voted_for_ RaftMemberSync[int32]
+	current_term_ RaftMemberSync[int]
+	voted_for_ RaftMemberSync[int]
 	logs []LogEntry
 
 	// V states
@@ -50,17 +50,17 @@ type Raft struct {
 	status_ RaftMemberSync[RaftStatus]
 	heartbeat_ RaftMemberSync[bool]
 
-	commit_index RaftMemberSync[int32]
-	last_applied RaftMemberSync[int32]
-	next_index_ []RaftMemberSync[int32]
-	match_index_ []RaftMemberSync[int32]
+	commit_index RaftMemberSync[int]
+	last_applied RaftMemberSync[int]
+	next_index_ []RaftMemberSync[int]
+	match_index_ []RaftMemberSync[int]
 
 }
 
-type RaftStatus int32
+type RaftStatus int
 
 type LogEntry struct {
-	Term_ int32
+	Term_ int
 	Cmd_ interface{}
 }
 
@@ -71,7 +71,7 @@ const (
 )
 
 type MemberType interface {
-	int32 | bool | RaftStatus 
+	int | bool | RaftStatus 
 }
 
 type RaftMemberSync[T MemberType] struct {
@@ -95,35 +95,35 @@ func (m *RaftMemberSync[T]) ReadMemberSync() T {
 // rpc structs
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	CandidateId_ int32
-	Term_ int32
+	CandidateId_ int
+	Term_ int
 
-	LastLogIndex_ int32
-	LastLogTerm_ int32
+	LastLogIndex_ int
+	LastLogTerm_ int
 }
 
 type RequestVoteReply struct {
 	// Your data here (2A).
 	VoteGranted_ bool
-	Term_ int32
+	Term_ int
 }
 
 type AppendEntryArgs struct {
-	Term_ int32
-	LeaderId_ int32
+	Term_ int
+	LeaderId_ int
 
-	PrevLogIndex_ int32
-	PrevLogTerm_ int32
+	PrevLogIndex_ int
+	PrevLogTerm_ int
 	Entries []LogEntry
-	LeaderCommit_ int32
+	LeaderCommit_ int
 }
 
 type AppendEntryReply struct {
-	Term_ int32
+	Term_ int
 	Success_ bool
 
 	// Find comflict entry
-	XTerm_ int32
-	XIndex_ int32
-	XLen_ int32
+	XTerm_ int
+	XIndex_ int
+	XLen_ int
 }
