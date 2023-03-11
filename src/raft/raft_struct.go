@@ -54,12 +54,12 @@ type Raft struct {
 	lastApplied int
 	nextIndex []int
 	matchIndex []int
-
 }
 
 type RaftStatus int
 
 type LogEntry struct {
+	Index int
 	Term int
 	Cmd interface{}
 }
@@ -104,4 +104,40 @@ type AppendEntryReply struct {
 	XTerm int
 	XIndex int
 	XLen int
+}
+
+type InstallSnapshotArgs struct {
+	Term int
+	LeaderId int
+
+	LastIncludedIndex int
+	LastIncludedTerm int
+
+	// Offset int
+	// Done = ture
+
+	Data []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+// Raft log op
+func (rf *Raft) getLastIndex() int {
+	return rf.log[len(rf.log)-1].Index
+}
+
+func (rf *Raft) getFirstIndex() int {
+	return rf.log[0].Index
+}
+
+func (rf *Raft) indexToNaiveIndex(index int) int {
+	offset := rf.getFirstIndex()
+	return index - offset
+}
+
+func (rf *Raft) naiveIndexToIndex(n_index int) int {
+	offset := rf.getFirstIndex()
+	return offset + n_index
 }
