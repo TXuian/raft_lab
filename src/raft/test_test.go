@@ -23,8 +23,6 @@ const RaftElectionTimeout = 1000 * time.Millisecond
 
 func TestInitialElection2A(t *testing.T) {
 
-	test_arr := []int{0,1,2,3,4,5};
-	fmt.Printf("slice: %v\n", test_arr[len(test_arr):]);
 
 	servers := 3
 	cfg := make_config(t, servers, false, false)

@@ -45,8 +45,6 @@ func (rf *Raft) encodeState() []byte {
 	encoder := labgob.NewEncoder(stream)
 
 	// !persist contains lock
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	// encode data
 	err := encoder.Encode(rf.currentTerm)
 	if err != nil {
@@ -68,7 +66,8 @@ func (rf *Raft) encodeState() []byte {
 
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// DPrintf("[Persist] data: %v", data)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.persister.SaveRaftState(rf.encodeState())
 }
 
@@ -100,13 +99,37 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 //
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	DPrintf("[CondInstallSnapshot] S%d, lastIncludedIndex: %d, currentIndex: %d", rf.me, lastIncludedIndex, rf.log[len(rf.log)-1].Index)
+	if lastIncludedIndex < rf.commitIndex {
+		return false
+	}
+
+	if rf.naiveIndexToIndex(len(rf.log)-1) < lastIncludedIndex {
+		rf.log = rf.log[:1]
+		ArrDeepCopy(&rf.log)
+	} else {
+		rf.log = rf.log[rf.indexToNaiveIndex(lastIncludedIndex):]
+		ArrDeepCopy(&rf.log)
+	}
+
+	rf.log[0] = LogEntry{
+		Term: lastIncludedTerm,
+		Index: lastIncludedIndex,
+		Cmd: nil,
+	}
+	rf.commitIndex = lastIncludedIndex
+	rf.lastApplied = lastIncludedIndex 
+
+	rf.persister.SaveStateAndSnapshot(rf.encodeState(), snapshot)
 
 	return true
 }
@@ -120,6 +143,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	DPrintf("[Snapshot] S%d, index: %d, currentIndex: %d", rf.me, index, rf.log[len(rf.log)-1].Index)
 	// check index
 	index_offset := rf.getFirstIndex()
 	if index < index_offset {
@@ -128,8 +152,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 
 	// truncate log
-	arr := rf.log[index - index_offset:]
-	ArrDeepCopy(&arr)
+	rf.log = rf.log[rf.indexToNaiveIndex(index):]
+	ArrDeepCopy(&rf.log)
 	// guard entry
 	rf.log[0].Cmd = nil
 
@@ -142,9 +166,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 func (rf *Raft) toLeader() {
 	// change state
 	rf.state = LEADER
-	// make nextIndex and matchIndex
-	rf.nextIndex = make([]int, len(rf.peers))
-	rf.matchIndex = make([]int, len(rf.peers))
+	// init nextIndex and matchIndex
 	for p := range rf.nextIndex {
 		rf.nextIndex[p] = rf.getLastIndex() + 1
 		rf.matchIndex[p] = 0
@@ -271,7 +293,6 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.persist()
 	defer rf.mu.Unlock()
 
 	// check term
@@ -289,12 +310,16 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
+	rf.heartbeat = true
+
+	DPrintf("[InstallSnapshot RPC] S%d, lastIncludedIndex: %d, currentIndex: %d\n", rf.me, args.LastIncludedIndex, rf.log[len(rf.log)-1].Index)
 	n_idx := len(rf.log) - 1 
-	for ; n_idx >= 0; n_idx -- {
-		if rf.log[n_idx].Index == args.LastIncludedIndex && 
+	for ; n_idx >= 0; n_idx-- {
+		if rf.naiveIndexToIndex(n_idx) == args.LastIncludedIndex && 
 			rf.log[n_idx].Term == args.LastIncludedTerm {
-			arr := rf.log[n_idx:]
-			ArrDeepCopy(&arr)
+			rf.log = rf.log[n_idx:]
+			ArrDeepCopy(&rf.log)
+			break
 		}
 	}
 	if n_idx == -1 {
@@ -306,15 +331,17 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			Cmd: nil,
 		}
 	}
+	rf.lastApplied = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
 
-	go func() {
-		rf.applyCh <- ApplyMsg{
-			SnapshotValid: true,
-			Snapshot: args.Data,
-			SnapshotTerm: args.LastIncludedTerm,
-			SnapshotIndex: args.LastIncludedIndex,
-		}
-	} ()
+	rf.persister.SaveStateAndSnapshot(rf.encodeState(), args.Data)
+	
+	rf.applyCh <- ApplyMsg{
+		SnapshotValid: true,
+		Snapshot: args.Data,
+		SnapshotTerm: args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
 }
 
 // RPC sender --------------------------------------
@@ -387,7 +414,9 @@ func (rf *Raft) handleDelayedReplicator(p int) {
 	rf.mu.Unlock()
 
 	ok := rf.peers[p].Call("Raft.InstallSnapshot", &args, &reply)
-	if !ok { return }
+	if !ok { 
+		return
+	}
 
 	rf.mu.Lock()
 	defer rf.persist()
@@ -451,9 +480,9 @@ func (rf *Raft) sendAppendEntry() {
 
 			// failed RPC
 			if !ok { return }
-			DPrintf("[AppendEntry reply] S%d get AppendEntry Reply from S%d, isLeader: %v, reply: %v\n", rf.me, p, (rf.state == LEADER), reply_inside)
 
 			rf.mu.Lock()
+			DPrintf("[AppendEntry reply] S%d get AppendEntry Reply from S%d, isLeader: %v, reply: %v\n", rf.me, p, (rf.state == LEADER), reply_inside)
 			defer rf.persist()
 			defer rf.mu.Unlock()
 			if reply_inside.Term > rf.currentTerm {
@@ -478,7 +507,7 @@ func (rf *Raft) sendAppendEntry() {
 				}
 
 				x_term_index := -1
-				for n_idx := args.PrevLogIndex; n_idx >= 0; n_idx-- {
+				for n_idx := rf.indexToNaiveIndex(args.PrevLogIndex); n_idx >= 0; n_idx-- {
 					if rf.log[n_idx].Term == reply_inside.XTerm {
 						x_term_index = rf.log[n_idx].Index
 						break
@@ -565,7 +594,7 @@ const (
 func (rf *Raft) isNeedApply() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.lastApplied <= rf.commitIndex
+	return rf.lastApplied < rf.commitIndex
 }
 
 func (rf *Raft) commitEntries() {
@@ -577,8 +606,8 @@ func (rf *Raft) commitEntries() {
 			rf.mu.Lock()
 			apply_msg := ApplyMsg{
 				CommandValid: true,
-				Command: rf.log[rf.indexToNaiveIndex(rf.lastApplied)].Cmd,
-				CommandIndex: int(rf.lastApplied),
+				Command: rf.log[rf.indexToNaiveIndex(rf.lastApplied + 1)].Cmd,
+				CommandIndex: rf.lastApplied + 1,
 			}
 			rf.mu.Unlock()
 			rf.applyCh <- apply_msg
@@ -641,31 +670,30 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		currentTerm: 0,
 		votedFor: -1,
 		log: make([]LogEntry, 0),
+		
+		nextIndex: make([]int, len(peers)),
+		matchIndex: make([]int, len(peers)),
 
 		state: FOLLOWER,
 		heartbeat: false,
-		
-		commitIndex: 0,
 	}
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.mu.Lock()
 	rf.log = append(rf.log, LogEntry{
 		Index: 0,
 		Cmd: 0,
 		Term: 0,
 	})
-	rf.mu.Unlock()
-
+	
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
-	rf.lastApplied = rf.log[0].Index
-
+	
+	rf.lastApplied = rf.naiveIndexToIndex(0) 
+	rf.commitIndex = rf.naiveIndexToIndex(0)
+	
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.commitEntries()
-
 
 	return rf
 }
